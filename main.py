@@ -8,11 +8,13 @@ from torch.cuda.amp import GradScaler, autocast
 import gc
 import numpy as np
 import random
+from torch.nn.utils.rnn import pad_sequence
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 # global variable
 CURRENT_EPOCH = 0
 
-# ================== Dataset (unchanged) ==================
+# ================== 1.Dataset (unchanged) ==================
 class PTFeatureDataset(Dataset):
     def __init__(self, feature_root, max_frames=16):
         self.feature_root = feature_root
@@ -52,60 +54,49 @@ class PTFeatureDataset(Dataset):
 
     def label_from_name(self, name):
         label_dict = {
-            "carrying":0, "checking_time":1, "closing":2, "crouching":3,
-            "entering":4, "exiting":5, "fall":6, "jumping":7, "kicking":8,
-            "loitering":9, "looking_around":10, "opening":11, "picking_up":12,
-            "pointing":13, "pulling":14, "pushing":15, "running":16,
-            "setting_down":17, "standing":18, "talking":19, "talking_on_phone":20,
-            "throwing":21, "transferring_object":22, "using_phone":23,
-            "walking":24, "waving_hand":25
+            "carrying": 0, "checking_time": 1, "closing": 2, "crouching": 3, "entering": 4, "exiting": 5,
+            "fall": 6, "jumping": 7, "kicking": 8, "loitering": 9, "looking_around": 10, "opening": 11,
+            "picking_up": 12, "pointing": 13, "pulling": 14, "pushing": 15, "running": 16, "setting_down": 17,
+            "standing": 18, "talking": 19, "talking_on_phone": 20, "throwing": 21,
+            "transferring_object": 22, "using_phone": 23, "walking": 24, "waving_hand": 25,
+            "drinking": 26, "pocket_in": 27, "pocket_out": 28, "sitting": 29, "sitting_down": 30,
+            "standing_up": 31, "using_pc": 32, "carrying_heavy": 33, "carrying_light": 34
         }
         return label_dict.get(name, -1)
 
-
-def collate_fn(batch, max_frames=16):
+def collate_fn_keep_imu(batch, max_frames=16):
     rgb_list, imu_list, label_list = [], [], []
 
     for b in batch:
-        # ---------- RGB ----------
-        v = b['rgb']  # shape: C, T, H, W
-        t_v = v.shape[1]
-        if t_v < max_frames:
-            pad_v = v[:, -1:, :, :].repeat(1, max_frames - t_v, 1, 1)
+        # ---------- RGB pad/truncate ----------
+        v = b['rgb']  # [C, T, H, W]
+        T_v = v.shape[1]
+        if T_v < max_frames:
+            pad_v = v[:, -1:, :, :].repeat(1, max_frames - T_v, 1, 1)
             v = torch.cat([v, pad_v], dim=1)
         else:
             v = v[:, :max_frames]
         rgb_list.append(v)
 
-        # ---------- IMU ----------
-        imu = b['imu']  # shape: T, D
-        t_i = imu.shape[0]
-        if t_i < max_frames:
-            pad_i = imu[-1:].repeat(max_frames - t_i, 1)
-            imu = torch.cat([imu, pad_i], dim=0)
-        else:
-            imu = imu[:max_frames]
-        imu_list.append(imu)
+        # ---------- IMU keep original ----------
+        imu_list.append(b['imu'])  # [T_i, D]
 
         label_list.append(b['label'])
 
     batch_dict = {
-        "rgb": torch.stack(rgb_list, dim=0),
-        "imu": torch.stack(imu_list, dim=0),
+        "rgb": torch.stack(rgb_list, dim=0),       # [B, C, T, H, W]
+        "imu": imu_list,                            # list of [T_i, D]
         "label": torch.tensor(label_list, dtype=torch.long),
         "video_path": [b['video_path'] for b in batch]
     }
 
     return batch_dict
 
-
 def collate_fn_16(batch):
-    return collate_fn(batch, max_frames=16)
+    return collate_fn_keep_imu(batch, max_frames=16)
 
-def collate_fn_32(batch):
-    return collate_fn(batch, max_frames=32)
 
-# ================== 2. Encoders（沿用） ==================
+# ================== 2. Encoders ==================
 class RGBEncoder(nn.Module):
     def __init__(self, pretrained=False):
         super().__init__()
@@ -137,57 +128,38 @@ class SEModule(nn.Module):
         y = self.sigmoid(y)
         return x * y.unsqueeze(1)
 
-# class IMUEncoder(nn.Module):
-#     def __init__(self, in_dim=9, hidden_dim=66, lstm_layers=1, groups=3, dropout=0.2):
-#     # def __init__(self, in_dim=9, hidden_dim=33, lstm_layers=1, groups=3, dropout=0.2):
-#         super().__init__()
-#         self.groups = groups
-#         self.group_conv = nn.Conv1d(in_dim, hidden_dim, kernel_size=3, padding=1, groups=groups)
-#         self.se = SEModule(hidden_dim)
-#         self.lstm = nn.LSTM(hidden_dim, hidden_dim, num_layers=lstm_layers, batch_first=True)
-#         self.dropout = nn.Dropout(dropout)
-#
-#     def forward(self, x):
-#         x = x.transpose(1, 2)          # [B, C, T]
-#         x = F.relu(self.group_conv(x)) # [B, hidden_dim, T]
-#         x = x.transpose(1, 2)          # [B, T, hidden_dim]
-#         x = self.se(x)
-#         _, (h_n, _) = self.lstm(x)
-#         out = h_n[-1]                  # [B, hidden_dim]
-#         out = self.dropout(out)
-#         return out
-
 class IMUEncoder(nn.Module):
-    def __init__(self, in_dim=9, hidden_dim=128, lstm_layers=1, dropout=0.2):
-        """
-        in_dim: IMU 输入通道数
-        hidden_dim: 输出特征维度，可以调大
-        lstm_layers: LSTM 层数
-        dropout: dropout 概率
-        """
+    def __init__(self, in_dim=18, hidden_dim=128, lstm_layers=1, dropout=0.2):
         super().__init__()
-        # 普通 1D 卷积代替分组卷积
         self.conv1 = nn.Conv1d(in_dim, hidden_dim, kernel_size=3, padding=1)
         self.relu = nn.ReLU(inplace=True)
-
-        # LSTM
         self.lstm = nn.LSTM(hidden_dim, hidden_dim, num_layers=lstm_layers, batch_first=True)
-
-        # dropout
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
+    def forward(self, x_list):
         """
-        x: [B, T, C]  or [B, C, T] 需保证输入 [B, T, C]，transpose 会调整
+        x_list: list of [T_i, C], length = B
         """
-        x = x.transpose(1, 2)      # [B, C, T]
-        x = self.relu(self.conv1(x)) # [B, hidden_dim, T]
-        x = x.transpose(1, 2)      # [B, T, hidden_dim]
-        _, (h_n, _) = self.lstm(x)
-        out = h_n[-1]              # [B, hidden_dim]
+        device = x_list[0].device
+        lengths = torch.tensor([x.shape[0] for x in x_list], device=device)
+        x_padded = pad_sequence(x_list, batch_first=True)  # [B, T_max, C]
+        x = x_padded.transpose(1, 2)  # [B, C, T_max]
+        x = self.relu(self.conv1(x))
+        x = x.transpose(1, 2)  # [B, T_max, hidden_dim]
+
+        # pack for LSTM
+        packed = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
+        packed_out, _ = self.lstm(packed)
+        out_unpacked, _ = pad_packed_sequence(packed_out, batch_first=True)
+        # out_unpacked: [B, T_max, hidden_dim]
+
+        # === 时间维平均池化（mask 有效长度）===
+        mask = torch.arange(out_unpacked.size(1), device=device)[None, :] < lengths[:, None]
+        mask = mask.unsqueeze(-1).float()
+
+        out = (out_unpacked * mask).sum(dim=1) / lengths.unsqueeze(1)
         out = self.dropout(out)
         return out
-
 
 # ================== 3. Fusion (modified) ==================
 class GMUFusion(nn.Module):
@@ -197,17 +169,13 @@ class GMUFusion(nn.Module):
         feature_dim: 每个模态 embedding 的维度
         """
         super().__init__()
-
         # g = sigmoid(W * [rgb, imu])
         self.gate = nn.Linear(feature_dim * 2, feature_dim)
-
-        # optional enhancement
         self.ffn = nn.Sequential(
             nn.Linear(feature_dim * 3, feature_dim),  # 注意这里改成 3*feature_dim
             nn.ReLU(),
             nn.Linear(feature_dim, feature_dim)
         )
-
         self.norm = nn.LayerNorm(feature_dim)
         self.dropout = nn.Dropout(dropout)
 
@@ -216,22 +184,12 @@ class GMUFusion(nn.Module):
         features: list of [B, D], [rgb_feat, imu_feat]
         """
         rgb, imu = features  # 各 [B, D]
-
-        # concat
         h = torch.cat([rgb, imu], dim=-1)   # [B, 2D]
-
-        # gating
         g = torch.sigmoid(self.gate(h))     # [B, D]
-
-        # GMU 核心
         fused = g * rgb + (1 - g) * imu     # [B, D]
-
         # 加强非线性
         enhanced = self.ffn(torch.cat([fused, h], dim=-1))  # [B, 3D]
-
-        # LN + Dropout
         out = self.dropout(self.norm(enhanced))
-
         return out   # [B, D]
 
 # ================== 4. Projectors (modified to include projection to common dim) ==================
@@ -246,7 +204,7 @@ class ContrastiveProjector(nn.Module):
         z = z / (z.norm(dim=1, keepdim=True) + 1e-8)
         return z
 
-# ================== 5. Full Model (modified) ==================
+# ================== 5.Model ==================
 class MultiModalHAR(nn.Module):
     def __init__(self, num_classes, common_dim=128, contrastive_dim=64, completion_confidence_scale=0.7):
         super().__init__()
@@ -265,11 +223,10 @@ class MultiModalHAR(nn.Module):
             nn.init.xavier_uniform_(m.weight)
             nn.init.zeros_(m.bias)
 
-        # fusion for 2 modalities
         self.fusion = GMUFusion(feature_dim=common_dim, dropout=0.3)
 
         self.fc = nn.Sequential(
-            nn.Linear(640, 256),  # 512 / 128
+            nn.Linear(128, 256),  # 512 / 128
             nn.ReLU(),
             nn.Dropout(0.3),
             nn.Linear(256, num_classes)
@@ -279,15 +236,8 @@ class MultiModalHAR(nn.Module):
         self.proj_rgb = ContrastiveProjector(common_dim, contrastive_dim)
         self.proj_imu = ContrastiveProjector(common_dim, contrastive_dim)
 
-        # per-modality classification head (for confidence)
-        # self.modality_clf = nn.ModuleList([
-        #     nn.Linear(contrastive_dim, num_classes) for _ in range(2)
-        # ])
-
-        # self.num_classes = num_classes
-        # self.completion_confidence_scale = completion_confidence_scale
-
     def forward(self, rgb, depth, skel, imu, mode="classification", do_completion=False):
+
         # only extract rgb+imu
         f_rgb = self.rgb_enc(rgb)      # [B,512]
         f_imu = self.imu_enc(imu)      # [B,128]
@@ -298,48 +248,17 @@ class MultiModalHAR(nn.Module):
         c_list = [c_rgb, c_imu]
 
         if mode == "classification":
-
-            fused = self.fusion(c_list)   # expect list of 2
-            cls_feat = torch.cat([f_rgb, fused], dim=1)  # [B, ]
-            out = self.fc(cls_feat)
-
+            fused = self.fusion(c_list)
+            out = self.fc(torch.cat([fused], dim=1))
             return out, None, None
 
-            # # modality-wise projector
-            # p_rgb = self.proj_rgb(c_rgb)
-            # p_imu = self.proj_imu(c_imu)
-            #
-            # p_list = [p_rgb, p_imu]
-            # per_modality_logits = [clf(p) for clf, p in zip(self.modality_clf, p_list)]
-            # per_modality_probs = [F.softmax(l, dim=1) for l in per_modality_logits]
-            # per_modality_conf = [torch.max(p, dim=1).values for p in per_modality_probs]
-            #
-            #
-            # return out, per_modality_conf, per_modality_logits
-
-        # if mode == "classification":
-        #     out = self.fc(f_imu)
-        #     return out, None, None
 
         elif mode in ("contrastive", "contrastive_with_completion"):
             p_rgb = self.proj_rgb(c_rgb)
             p_imu = self.proj_imu(c_imu)
-
             return (p_rgb, p_imu), (None, None), None
 
-# ================== Loss functions (unchanged mostly) ==================
-def intra_modal_contrastive(z, labels, temperature=0.07):
-    logits = torch.matmul(z, z.T) / temperature
-    mask = torch.eq(labels.unsqueeze(1), labels.unsqueeze(0)).float().to(z.device)
-    logits_mask = torch.ones_like(mask) - torch.eye(mask.size(0), device=z.device)
-    mask = mask * logits_mask
-    positives = torch.sum(torch.exp(logits) * mask, dim=1)
-    denominator = torch.sum(torch.exp(logits) * logits_mask, dim=1)
-    loss = -torch.log((positives + 1e-8) / (denominator + 1e-8))
-    if (mask.sum(1) == 0).all():
-        return torch.tensor(0.0, device=z.device, requires_grad=True)
-    return loss.mean()
-
+# ================== 6.Loss  ==================
 def cross_modal_contrastive(z1, z2, labels, temperature=0.07):
     logits = torch.matmul(z1, z2.T) / temperature
     mask = torch.eq(labels.unsqueeze(1), labels.unsqueeze(0)).float().to(z1.device)
@@ -349,11 +268,6 @@ def cross_modal_contrastive(z1, z2, labels, temperature=0.07):
     if (mask.sum(1) == 0).all():
         return torch.tensor(0.0, device=z1.device, requires_grad=True)
     return loss.mean()
-
-def cosine_sim(a, b, eps=1e-8):
-    a_n = a / (a.norm(dim=1, keepdim=True) + eps)
-    b_n = b / (b.norm(dim=1, keepdim=True) + eps)
-    return (a_n * b_n).sum(dim=1)
 
 def supervised_contrastive_loss(features, labels, temperature=0.15):
     device = features.device
@@ -368,7 +282,6 @@ def supervised_contrastive_loss(features, labels, temperature=0.15):
     loss = -(mask * log_prob).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
     return loss.mean()
 
-# Alignment & MMD & coral (unchanged)
 def pairwise_mean_alignment(projs):
     means = [p.mean(dim=0) for p in projs]
     loss = 0.0
@@ -381,145 +294,13 @@ def pairwise_mean_alignment(projs):
         return torch.tensor(0.0, device=projs[0].device)
     return loss / count
 
-def coral_loss(x, y):
-    d = x.size(1)
-    xm = x - x.mean(dim=0, keepdim=True)
-    ym = y - y.mean(dim=0, keepdim=True)
-    cx = (xm.t() @ xm) / (x.size(0) - 1)
-    cy = (ym.t() @ ym) / (y.size(0) - 1)
-    loss = F.mse_loss(cx, cy) / (4 * d * d)
-    return loss
-
-def pairwise_coral_alignment(projs):
-    loss = 0.0
-    count = 0
-    for i in range(len(projs)):
-        for j in range(i+1, len(projs)):
-            loss = loss + coral_loss(projs[i], projs[j])
-            count += 1
-    if count == 0:
-        return torch.tensor(0.0, device=projs[0].device)
-    return loss / count
-
-def _rbf_kernel(x, y, sigma):
-    x2 = (x*x).sum(dim=1, keepdim=True)
-    y2 = (y*y).sum(dim=1, keepdim=True)
-    dist2 = x2 - 2 * (x @ y.t()) + y2.t()
-    k = torch.exp(-dist2 / (2 * (sigma**2)))
-    return k
-
-def mmd_rbf(x, y, sigmas=(1.0, 2.0, 4.0)):
-    xx = 0.0
-    yy = 0.0
-    xy = 0.0
-    for s in sigmas:
-        Kxx = _rbf_kernel(x, x, s)
-        Kyy = _rbf_kernel(y, y, s)
-        Kxy = _rbf_kernel(x, y, s)
-        nx = x.size(0)
-        ny = y.size(0)
-        xx += (Kxx.sum() - torch.diag(Kxx).sum()) / (nx * (nx - 1) + 1e-8)
-        yy += (Kyy.sum() - torch.diag(Kyy).sum()) / (ny * (ny - 1) + 1e-8)
-        xy += Kxy.sum() / (nx * ny + 1e-8)
-    return xx + yy - 2.0 * xy
-
-def pairwise_mmd_alignment(projs, sigmas=(1.0,2.0,4.0)):
-    loss = 0.0
-    count = 0
-    for i in range(len(projs)):
-        for j in range(i+1, len(projs)):
-            loss = loss + mmd_rbf(projs[i], projs[j], sigmas=sigmas)
-            count += 1
-    if count == 0:
-        return torch.tensor(0.0, device=projs[0].device)
-    return loss / count
-
-# ================== Training utilities (unchanged with small mods) ==================
-# ================== MemoryQueue (带 label) ==================
-class MemoryQueue:
-    def __init__(self, feature_dim, queue_size=2048, device='cuda'):
-        self.queue_size = queue_size
-        self.feature_dim = feature_dim
-        self.device = device
-        self.registered = 0
-        self.ptr = 0
-        self.queue = torch.zeros(queue_size, feature_dim, device=device)
-        self.labels = torch.full((queue_size,), -1, dtype=torch.long, device=device)
-
-    @torch.no_grad()
-    def enqueue(self, features, labels):
-        """
-        features: [B, D]
-        labels: [B]
-        """
-        batch_size = features.size(0)
-        space_left = self.queue_size - self.ptr
-        if batch_size <= space_left:
-            self.queue[self.ptr:self.ptr+batch_size] = features
-            self.labels[self.ptr:self.ptr+batch_size] = labels
-            self.ptr += batch_size
-        else:
-            self.queue[self.ptr:] = features[:space_left]
-            self.labels[self.ptr:] = labels[:space_left]
-            self.queue[:batch_size-space_left] = features[space_left:]
-            self.labels[:batch_size-space_left] = labels[space_left:]
-            self.ptr = batch_size - space_left
-        self.registered = min(self.queue_size, self.registered + batch_size)
-
-    def get_queue(self):
-        return self.queue[:self.registered], self.labels[:self.registered]
-
-class EarlyStopping:
-    def __init__(self, patience=5, delta=1e-4, verbose=True):
-        self.patience = patience
-        self.delta = delta
-        self.counter = 0
-        self.best_loss = None
-        self.early_stop = False
-        self.verbose = verbose
-
-    def step(self, loss):
-        if self.best_loss is None:
-            self.best_loss = loss
-            return
-        elif loss < self.best_loss - self.delta:
-            self.best_loss = loss
-            self.counter = 0
-        else:
-            self.counter += 1
-            if self.verbose:
-                print(f"EarlyStopping counter: {self.counter} out of {self.patience}")
-            if self.counter >= self.patience:
-                self.early_stop = True
-
-def set_encoder_trainable(model, requires_grad: bool):
-    # for enc in [model.rgb_enc, model.depth_enc, model.skel_enc, model.imu_enc]:
-    for enc in [model.rgb_enc, model.imu_enc]:
-        for p in enc.parameters():
-            p.requires_grad = requires_grad
-
-def seed_worker(worker_id):
-    global CURRENT_EPOCH
-    # 每个 worker 的种子 = torch initial seed + 当前 epoch
-    worker_seed = (torch.initial_seed() + CURRENT_EPOCH) % 2 ** 32
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
-
-# ============== New: prototype + hard-negative helper ==============
 def prototype_contrastive_loss(embeddings, labels, queue=None, temperature=0.07, hard_k=8):
-    """
-    embeddings: [B, D] normalized (contrastive space)
-    labels: [B]
-    queue: optional tensor [Q, D] normalized
-    For each class in batch compute prototype (mean), then do a softmax over prototypes + selected hard negatives from queue.
-    """
     device = embeddings.device
     B, D = embeddings.shape
     labels_cpu = labels.cpu().numpy()
     unique_cls = sorted(list(set(labels_cpu)))
     if len(unique_cls) <= 1:
         return torch.tensor(0.0, device=device)
-
     # prototypes from batch
     prototypes = []
     proto_labels = []
@@ -566,13 +347,54 @@ def prototype_contrastive_loss(embeddings, labels, queue=None, temperature=0.07,
         loss = - (pos_logits - logsum)
         return loss.mean()
 
-def params_with_grad(model):
-    return [p for n, p in model.named_parameters()
-                   if p.requires_grad and not any(h in n for h in [
-                       "proj_rgb", "proj_imu", "to_common", "fusion"
-                   ])]
+# ================== 7.utils ==================
+class MemoryQueue:
+    def __init__(self, feature_dim, queue_size=2048, device='cuda'):
+        self.queue_size = queue_size
+        self.feature_dim = feature_dim
+        self.device = device
+        self.registered = 0
+        self.ptr = 0
+        self.queue = torch.zeros(queue_size, feature_dim, device=device)
+        self.labels = torch.full((queue_size,), -1, dtype=torch.long, device=device)
 
+    @torch.no_grad()
+    def enqueue(self, features, labels):
+        """
+        features: [B, D]
+        labels: [B]
+        """
+        batch_size = features.size(0)
+        space_left = self.queue_size - self.ptr
+        if batch_size <= space_left:
+            self.queue[self.ptr:self.ptr+batch_size] = features
+            self.labels[self.ptr:self.ptr+batch_size] = labels
+            self.ptr += batch_size
+        else:
+            self.queue[self.ptr:] = features[:space_left]
+            self.labels[self.ptr:] = labels[:space_left]
+            self.queue[:batch_size-space_left] = features[space_left:]
+            self.labels[:batch_size-space_left] = labels[space_left:]
+            self.ptr = batch_size - space_left
+        self.registered = min(self.queue_size, self.registered + batch_size)
 
+    def get_queue(self):
+        return self.queue[:self.registered], self.labels[:self.registered]
+
+def set_encoder_trainable(model, requires_grad: bool):
+    # for enc in [model.rgb_enc, model.depth_enc, model.skel_enc, model.imu_enc]:
+    for enc in [model.rgb_enc, model.imu_enc]:
+        for p in enc.parameters():
+            p.requires_grad = requires_grad
+
+def seed_worker(worker_id):
+    global CURRENT_EPOCH
+    # 每个 worker 的种子 = torch initial seed + 当前 epoch
+    worker_seed = (torch.initial_seed() + CURRENT_EPOCH) % 2 ** 32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+# ================== 8.pretrain & finetune & validation ==================
 def pretrain_contrastive_amp_supcon_with_queue(
     model, dataloader, optimizer, device,
     lambda_cross=0.5,
@@ -585,144 +407,180 @@ def pretrain_contrastive_amp_supcon_with_queue(
     queue_size=2048,
     hard_k=8,
 ):
-    """
-    版本：只使用 RGB + IMU 两个模态
-    """
     if align_methods is None:
         align_methods = ["mean"]
-
     model.train()
     scaler = GradScaler()
     optimizer.zero_grad()
-
     total_loss = 0.0
-
-    # ====== Two queues only ======
     queues = {
         "rgb": MemoryQueue(feature_dim=64, queue_size=queue_size, device=device),
         "imu": MemoryQueue(feature_dim=64, queue_size=queue_size, device=device),
     }
-
     for step, batch in enumerate(dataloader):
         rgb = batch['rgb'].to(device)
-        imu = batch['imu'].to(device)
+        # imu = batch['imu'].to(device)
+        imu = [x.to(device) for x in batch["imu"]]
         labels = batch['label'].to(device)
-
         with torch.amp.autocast("cuda"):
-
-            # ----- forward -----
             (p_rgb, p_imu), (c_rgb, c_imu), completion_outputs = \
                 model(rgb, None, None, imu, mode="contrastive_with_completion", do_completion=True)
-
-            # -----------------------------
-            #   Supervised contrastive loss
-            # -----------------------------
             supcon_losses = []
-
             for name, p_feat in zip(["rgb", "imu"], [p_rgb, p_imu]):
                 q_feat, q_label = queues[name].get_queue()
-
-                # combine with queue
                 if q_feat.size(0) > 0:
                     all_feat = torch.cat([p_feat, q_feat], dim=0)
                     all_label = torch.cat([labels, q_label], dim=0)
                 else:
                     all_feat = p_feat
                     all_label = labels
-
                 supcon_losses.append(supervised_contrastive_loss(all_feat, all_label))
-
-                # update queue
                 queues[name].enqueue(p_feat.detach(), labels)
-
             supcon_loss = torch.stack(supcon_losses).mean()
-
-            # -----------------------------
-            # Cross-modal contrastive (RGB ↔ IMU)
-            # -----------------------------
             loss_cross = cross_modal_contrastive(p_rgb, p_imu, labels)
-
-            # -----------------------------
-            # Alignment loss (pairwise)
-            # -----------------------------
             loss_align = torch.tensor(0.0, device=device)
             projs = [p_rgb, p_imu]
 
             if "mean" in align_methods:
                 loss_align += pairwise_mean_alignment(projs)
-            if "coral" in align_methods:
-                loss_align += pairwise_coral_alignment(projs)
-            if "mmd" in align_methods:
-                loss_align += pairwise_mmd_alignment(projs)
-
-            # -----------------------------
-            # Prototype loss
-            # -----------------------------
-            # Global queue concat
             global_q = None
             if queues["rgb"].get_queue()[0].size(0) > 0:
                 q_rgb, _ = queues["rgb"].get_queue()
                 q_imu, _ = queues["imu"].get_queue()
                 global_q = torch.cat([q_rgb, q_imu], dim=0)
-
-            # Avg projection = representation of sample
             p_avg = (p_rgb + p_imu) / 2.0
-
             proto_loss = prototype_contrastive_loss(
                 p_avg, labels, queue=global_q, temperature=0.07, hard_k=hard_k
             )
-
-            # -----------------------------
-            # Loss list (no completion now)
-            # -----------------------------
             losses = [loss_cross, supcon_loss, loss_align, proto_loss]
             init_lambdas = [lambda_cross, lambda_supcon, lambda_align, lambda_proto]
-
             # Dynamic λ update
             if 'prev_losses' not in globals():
                 prev_losses = [l.item() for l in losses]
                 delta_losses = [1.0 / lam if lam > 0 else 1.0 for lam in init_lambdas]
-
             alpha = 0.9
             eps = 1e-6
             lambda_list = []
-
             for i, l in enumerate(losses):
                 curr = l.item()
                 delta = (prev_losses[i] - curr) / (prev_losses[i] + eps)
                 delta_losses[i] = alpha * delta_losses[i] + (1 - alpha) * delta
-
                 if init_lambdas[i] == 0:
                     lam = 0.0
                 else:
                     lam = init_lambdas[i] / (delta_losses[i] + eps)
                     lam = min(max(lam, 0.01), 10.0)
-
                 lambda_list.append(lam)
                 prev_losses[i] = curr
-
             # normalize
             s = sum(lambda_list)
             lambda_list = [l / s * len(lambda_list) for l in lambda_list]
-
             # final loss
             if if_fixedlambda:
                 loss = sum(l * w for l, w in zip(losses, init_lambdas))
             else:
                 loss = sum(l * w for l, w in zip(losses, lambda_list))
-
             loss = loss / accumulation_steps
-
         scaler.scale(loss).backward()
-
         if (step + 1) % accumulation_steps == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
-
         total_loss += loss.item() * accumulation_steps
+    return total_loss / len(dataloader)
+
+def pretrain_contrastive_supcon(
+    model, dataloader, optimizer, device,
+    lambda_cross=0.5,
+    lambda_supcon=0.5,
+    if_fixedlambda=False,
+    queue_size=2048,
+    warmup_queue=True,   # 新增参数，是否队列预热
+):
+    model.train()
+    scaler = GradScaler()
+    optimizer.zero_grad()
+    total_loss = 0.0
+    queues = {
+        "rgb": MemoryQueue(feature_dim=64, queue_size=queue_size, device=device),
+        "imu": MemoryQueue(feature_dim=64, queue_size=queue_size, device=device),
+    }
+    prev_losses = None
+    delta_losses = None
+    alpha = 0.9
+    eps = 1e-6
+
+    for step, batch in enumerate(dataloader):
+        rgb = batch['rgb'].to(device)
+        imu = [x.to(device) for x in batch["imu"]]
+        labels = batch['label'].to(device)
+
+        with torch.amp.autocast("cuda"):
+            (p_rgb, p_imu), _, _ = model(
+                rgb, None, None, imu, mode="contrastive_with_completion", do_completion=True
+            )
+
+            # --------------------- supcon loss ---------------------
+            supcon_losses = []
+            queues_ready = True
+            for name, p_feat in zip(["rgb", "imu"], [p_rgb, p_imu]):
+                q_feat, q_label = queues[name].get_queue()
+
+                # 如果队列没满，并且启用预热模式，只enqueue，不计算loss
+                min_negatives = 128
+                if warmup_queue and q_feat.size(0) < min_negatives:
+                    queues[name].enqueue(p_feat.detach(), labels)
+                    queues_ready = False
+                    continue
+
+                all_feat = torch.cat([p_feat, q_feat], dim=0)
+                all_label = torch.cat([labels, q_label], dim=0)
+                supcon_losses.append(supervised_contrastive_loss(all_feat, all_label))
+                queues[name].enqueue(p_feat.detach(), labels)
+
+            supcon_loss = torch.stack(supcon_losses).mean() if queues_ready else torch.tensor(0.0, device=device)
+
+            # --------------------- cross-modal loss ---------------------
+            loss_cross = cross_modal_contrastive(p_rgb, p_imu, labels)
+            # --------------------- combine losses ---------------------
+            losses = [loss_cross, supcon_loss]
+            print(losses)
+            init_lambdas = [lambda_cross, lambda_supcon]
+            if prev_losses is None:
+                prev_losses = [l.item() for l in losses]
+                delta_losses = [1.0 / lam if lam > 0 else 1.0 for lam in init_lambdas]
+            lambda_list = []
+            for i, l in enumerate(losses):
+                curr = l.item()
+                delta = (prev_losses[i] - curr) / (prev_losses[i] + eps)
+                delta_losses[i] = alpha * delta_losses[i] + (1 - alpha) * delta
+                if init_lambdas[i] == 0:
+                    lam = 0.0
+                else:
+                    lam = init_lambdas[i] / (delta_losses[i] + eps)
+                    lam = min(max(lam, 0.01), 10.0)
+                lambda_list.append(lam)
+                prev_losses[i] = curr
+            # normalize
+            s = sum(lambda_list)
+            lambda_list = [l / s * len(lambda_list) for l in lambda_list]
+            # final loss
+            if if_fixedlambda:
+                loss = sum(l * w for l, w in zip(losses, init_lambdas))
+            else:
+                loss = sum(l * w for l, w in zip(losses, lambda_list))
+
+        # ---- backward ----
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
+
+        total_loss += loss.item()
 
     return total_loss / len(dataloader)
 
@@ -739,7 +597,8 @@ def finetune_classification(
 
     for step, batch in enumerate(dataloader):
         rgb = batch["rgb"].to(device)
-        imu = batch["imu"].to(device)
+        # imu = batch["imu"].to(device)
+        imu = [x.to(device) for x in batch["imu"]]
         labels = batch["label"].to(device)
 
         with torch.amp.autocast("cuda"):
@@ -772,7 +631,7 @@ def finetune_classification(
         scaler.step(optimizer)
         scaler.update()
 
-        total_loss += loss.item()
+        total_loss += loss.item() * label_f.size(0)
         total_acc += (logit_f.argmax(1) == label_f).sum().item()
         total_count += label_f.size(0)
 
@@ -788,7 +647,8 @@ def validate_classification(model, dataloader, criterion, device):
     with torch.no_grad():
         for batch in dataloader:
             rgb = batch["rgb"].to(device)
-            imu = batch["imu"].to(device)
+            # imu = batch["imu"].to(device)
+            imu = [x.to(device) for x in batch["imu"]]
             labels = batch["label"].to(device)
 
             logits, _, _ = model(rgb, None, None, imu, mode="classification", do_completion=False)
@@ -811,14 +671,14 @@ def validate_classification(model, dataloader, criterion, device):
 
 # ================== Main ==================
 if __name__ == "__main__":
-    # ===== GPU 性能与稳定性设置 =====
+    #GPU 性能与稳定性设置
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False
     torch.set_float32_matmul_precision('medium')
     torch.cuda.empty_cache()
     gc.collect()
 
-    feature_root = r"D:\HAR\MMAct_preprocessed_augment\train"
+    feature_root = r"D:\HAR\MMAct_preprocessed_clean\train"
     dataset = PTFeatureDataset(feature_root, max_frames=16)
     dataloader = DataLoader(
         dataset,
@@ -832,7 +692,7 @@ if __name__ == "__main__":
         worker_init_fn=seed_worker
     )
 
-    val_root = r"D:\HAR\MMAct_preprocessed_augment\val"
+    val_root = r"D:\HAR\MMAct_preprocessed_clean\val"
     val_dataset = PTFeatureDataset(val_root, max_frames=16)
     val_loader = DataLoader(
         val_dataset,
@@ -844,13 +704,13 @@ if __name__ == "__main__":
     )
 
 
-    # ===== 模型 & 损失 =====
+    #模型 & 损失
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MultiModalHAR(num_classes=26, common_dim=128, contrastive_dim=64).to(device)
+    model = MultiModalHAR(num_classes=35, common_dim=128, contrastive_dim=64).to(device)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     accumulation_steps = 1
 
-    # ===== 预训练阶段 =====
+    # ================== 1.pretrain ==================
     # if_pretrain = True
     if_pretrain = False
     if if_pretrain:
@@ -868,66 +728,77 @@ if __name__ == "__main__":
                     param.requires_grad = True
 
             optimizer1 = torch.optim.Adam([
-                {"params": model.rgb_enc.parameters(), "lr": 1e-5},
-                {"params": model.imu_enc.parameters(), "lr": 1e-4},
-                {"params": model.proj_rgb.parameters(), "lr": 5e-5},
-                {"params": model.proj_imu.parameters(), "lr": 5e-5},
-                {"params": model.to_common.parameters(), "lr": 5e-5},
-                {"params": model.fusion.parameters(), "lr": 5e-5},
+                {"params": model.rgb_enc.parameters(), "lr": 3e-5},
+                {"params": model.imu_enc.parameters(), "lr": 3e-3},
+                {"params": model.proj_rgb.parameters(), "lr": 2e-4},
+                {"params": model.proj_imu.parameters(), "lr": 2e-4},
+                {"params": model.to_common.parameters(), "lr": 2e-4},
             ], weight_decay=1e-4)
 
-            loss = pretrain_contrastive_amp_supcon_with_queue(
+            # loss = pretrain_contrastive_amp_supcon_with_queue(
+            #     model, dataloader, optimizer1, device,
+            #     lambda_cross=0.35, lambda_supcon=0.2,
+            #     lambda_align=0.05, lambda_proto=0.8, if_fixedlambda=False,
+            #     align_methods=['mean'],
+            #     accumulation_steps=accumulation_steps,
+            #     queue_size=2048,
+            #     hard_k=8
+            # )
+
+            loss = pretrain_contrastive_supcon(
                 model, dataloader, optimizer1, device,
                 lambda_cross=0.35, lambda_supcon=0.2,
-                lambda_align=0.05, lambda_proto=0.8, if_fixedlambda=False,
-                align_methods=['mean'],
-                accumulation_steps=accumulation_steps,
-                queue_size=2048,
-                hard_k=8
+                if_fixedlambda=True, queue_size=2048,
             )
+
             print(f"[Pretrain] Epoch {epoch}: loss={loss:.4f}")
-            torch.save(model.state_dict(), f"pretrain_rgbimu/pretrain_epoch_{epoch}.pth")
+            torch.save(model.state_dict(), f"pretrain/pretrain_epoch_{epoch}.pth")
     # else:
-    #     # ===== 加载已有 pretrain 权重 =====
     #     pretrain_path = "pretrain_rgbimu/pretrain_epoch_49.pth"
     #     checkpoint = torch.load(pretrain_path, map_location=device)
     #     model_dict = model.state_dict()
-    #     filtered_ckpt = {k: v for k, v in checkpoint.items() if k in model_dict and not k.startswith("fc.")}
+    #     filtered_ckpt = {k: v for k, v in checkpoint.items()
+    #                      if k in model_dict and not (k.startswith("fusion.") or k.startswith("fc."))}
     #     model_dict.update(filtered_ckpt)
     #     model.load_state_dict(model_dict, strict=False)
 
-    # ===== Finetune 阶段 =====
+    # ================== 2.Finetune ==================
     latest_model_path = "multimodal_har_model_latest.pth"
     best_model_path = "multimodal_har_model_best.pth"
     best_val_acc = 0.0
     num_finetune_epochs = 100
     val_interval = 3
 
-    # 全部 encoder 可训练
-    set_encoder_trainable(model, True)
+    for p in model.rgb_enc.parameters():
+        p.requires_grad = True
+    for p in model.imu_enc.parameters():
+        p.requires_grad = True
+    for p in model.to_common.parameters():
+        p.requires_grad = True
+    for p in model.fusion.parameters():
+        p.requires_grad = True
+    for p in model.fc.parameters():
+        p.requires_grad = True
 
     optimizer = torch.optim.Adam([
         {"params": model.rgb_enc.parameters(), "lr": 3e-5},
-        {"params": model.imu_enc.parameters(), "lr": 3e-5},
+        {"params": model.imu_enc.parameters(), "lr": 3e-3},
         {"params": model.to_common.parameters(), "lr": 2e-4},
         {"params": model.fusion.parameters(), "lr": 2e-4},
         {"params": model.fc.parameters(), "lr": 5e-4},
     ], weight_decay=1e-4)
-
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=50, eta_min=1e-6
     )
 
     for epoch in range(num_finetune_epochs):
-        # ===== Finetune 训练 =====
         loss, acc = finetune_classification(
             model, dataloader, optimizer, criterion, device,
         )
         print(f"[Finetune] Epoch {epoch}: loss={loss:.4f}, acc={acc:.4f}")
-
         scheduler.step()
 
-        # ===== Validation =====
+        # ================== 3.validate ==================
         if (epoch + 1) % val_interval == 0:
             val_loss, val_acc = validate_classification(model, val_loader, criterion, device)
             print(f"[Validation] Epoch {epoch}: loss={val_loss:.4f}, acc={val_acc:.4f}")
