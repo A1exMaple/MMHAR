@@ -112,22 +112,6 @@ class RGBEncoder(nn.Module):
         feat = self.dropout(feat)
         return feat  # [B,512]
 
-class SEModule(nn.Module):
-    def __init__(self, channels, reduction=4):
-        super().__init__()
-        self.fc1 = nn.Linear(channels, channels // reduction, bias=False)
-        self.relu = nn.ReLU(inplace=True)
-        self.fc2 = nn.Linear(channels // reduction, channels, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        y = x.mean(dim=1)  # [B, C]
-        y = self.fc1(y)
-        y = self.relu(y)
-        y = self.fc2(y)
-        y = self.sigmoid(y)
-        return x * y.unsqueeze(1)
-
 class IMUEncoder(nn.Module):
     def __init__(self, in_dim=18, hidden_dim=128, lstm_layers=1, dropout=0.2):
         super().__init__()
@@ -161,13 +145,294 @@ class IMUEncoder(nn.Module):
         out = self.dropout(out)
         return out
 
+class SEBlock(nn.Module):
+    def __init__(self, channels, reduction=4):
+        super().__init__()
+        self.fc1 = nn.Linear(channels, channels // reduction, bias=False)
+        self.fc2 = nn.Linear(channels // reduction, channels, bias=False)
+
+    def forward(self, x):
+        # x: [B, C, T]
+        s = x.mean(dim=2)              # [B, C]
+        s = F.relu(self.fc1(s))
+        s = torch.sigmoid(self.fc2(s)) # [B, C]
+        return x * s.unsqueeze(-1)
+
+
+class GroupSEIMUEncoder(nn.Module):
+    def __init__(
+        self,
+        in_dim=18,
+        hidden_dim=96,
+        lstm_layers=2,      # ← 改为 2 层
+        dropout=0.2,
+        groups=3            # ← IMU 常见：3 轴一组
+    ):
+        super().__init__()
+
+        # ===== 3 × GroupConv =====
+        self.conv1 = nn.Conv1d(
+            in_dim, hidden_dim, kernel_size=3, padding=1, groups=groups
+        )
+        self.conv2 = nn.Conv1d(
+            hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=groups
+        )
+        self.conv3 = nn.Conv1d(
+            hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=groups
+        )
+
+        # ===== SE =====
+        self.se = SEBlock(hidden_dim)
+
+        # ===== 1 × GroupConv（SE 之后）=====
+        self.conv4 = nn.Conv1d(
+            hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=groups
+        )
+
+        self.relu = nn.ReLU(inplace=True)
+
+        # ===== 2 × LSTM =====
+        self.lstm = nn.LSTM(
+            hidden_dim,
+            hidden_dim,
+            num_layers=lstm_layers,
+            batch_first=True
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x_list):
+        """
+        x_list: list of [T_i, C], length = B
+        """
+        device = x_list[0].device
+        lengths = torch.tensor([x.shape[0] for x in x_list], device=device)
+
+        # ===== padding =====
+        x_padded = pad_sequence(x_list, batch_first=True)   # [B, T, C]
+        x = x_padded.transpose(1, 2)                        # [B, C, T]
+
+        # ===== conv stack =====
+        x = self.relu(self.conv1(x))
+        x = self.relu(self.conv2(x))
+        x = self.relu(self.conv3(x))
+
+        # ===== SE =====
+        # x = self.se(x)
+
+        # ===== post-SE group conv =====
+        # x = self.relu(self.conv4(x))
+
+        # ===== LSTM =====
+        x = x.transpose(1, 2)  # [B, T, hidden_dim]
+        packed = pack_padded_sequence(
+            x, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
+        packed_out, _ = self.lstm(packed)
+        out_unpacked, _ = pad_packed_sequence(
+            packed_out, batch_first=True
+        )
+
+        # ===== masked temporal mean pooling =====
+        mask = (
+            torch.arange(out_unpacked.size(1), device=device)[None, :]
+            < lengths[:, None]
+        ).unsqueeze(-1).float()
+
+        out = (out_unpacked * mask).sum(dim=1) / lengths.unsqueeze(1)
+        out = self.dropout(out)
+
+        return out
+
+class SoftChannelGate(nn.Module):
+    def __init__(self, channels, reduction=4):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        """
+        x: [B, C, T]
+        """
+        # 通道交互强度（不是重要性）
+        g = self.fc(x.mean(dim=2))     # [B, C]
+        return x * g.unsqueeze(-1)
+
+class SoftChannelIMUEncoder(nn.Module):
+    def __init__(self, in_dim=18, hidden_dim=128, lstm_layers=1, dropout=0.2):
+        super().__init__()
+
+        self.conv1 = nn.Conv1d(in_dim, hidden_dim, kernel_size=3, padding=1)
+        self.relu = nn.ReLU(inplace=True)
+
+        # ⭐ 新增：Soft Grouping
+        self.soft_gate = SoftChannelGate(hidden_dim, reduction=4)
+
+        self.lstm = nn.LSTM(
+            hidden_dim,
+            hidden_dim,
+            num_layers=lstm_layers,
+            batch_first=True
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x_list):
+        """
+        x_list: list of [T_i, C], length = B
+        """
+        device = x_list[0].device
+        lengths = torch.tensor([x.shape[0] for x in x_list], device=device)
+
+        # ===== padding =====
+        x_padded = pad_sequence(x_list, batch_first=True)  # [B, T, C]
+        x = x_padded.transpose(1, 2)                       # [B, C, T]
+
+        # ===== Conv =====
+        x = self.relu(self.conv1(x))
+
+        # ⭐ Soft grouping（关键创新点）
+        x = self.soft_gate(x)
+
+        # ===== LSTM =====
+        x = x.transpose(1, 2)  # [B, T, hidden_dim]
+        packed = pack_padded_sequence(
+            x, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
+        packed_out, _ = self.lstm(packed)
+        out_unpacked, _ = pad_packed_sequence(
+            packed_out, batch_first=True
+        )
+
+        # ===== masked temporal mean pooling =====
+        mask = (
+            torch.arange(out_unpacked.size(1), device=device)[None, :]
+            < lengths[:, None]
+        ).unsqueeze(-1).float()
+
+        out = (out_unpacked * mask).sum(dim=1) / lengths.unsqueeze(1)
+        out = self.dropout(out)
+        return out
+
+class AxisAwareTemporalGate(nn.Module):
+    def __init__(self, channels, reduction=4):
+        super().__init__()
+
+        assert channels % 3 == 0, "hidden_dim must be divisible by 3 (acc/gyro/ori)"
+
+        self.channels = channels
+        self.per_axis_channels = channels // 3
+
+        # 每个 IMU 模态一个 gate（acc / gyro / ori）
+        self.fc_acc = nn.Sequential(
+            nn.Linear(self.per_axis_channels * 2, self.per_axis_channels // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.per_axis_channels // reduction, self.per_axis_channels),
+            nn.Sigmoid()
+        )
+        self.fc_gyro = nn.Sequential(
+            nn.Linear(self.per_axis_channels * 2, self.per_axis_channels // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.per_axis_channels // reduction, self.per_axis_channels),
+            nn.Sigmoid()
+        )
+        self.fc_ori = nn.Sequential(
+            nn.Linear(self.per_axis_channels * 2, self.per_axis_channels // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.per_axis_channels // reduction, self.per_axis_channels),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        """
+        x: [B, C, T]
+        """
+        B, C, T = x.shape
+
+        # ===== temporal statistics =====
+        mean = x.mean(dim=2)           # [B, C]
+        std  = x.std(dim=2)            # [B, C]
+        stat = torch.cat([mean, std], dim=1)  # [B, 2C]
+
+        # ===== split by modality =====
+        acc_stat  = stat[:, :2*self.per_axis_channels]
+        gyro_stat = stat[:, 2*self.per_axis_channels:4*self.per_axis_channels]
+        ori_stat  = stat[:, 4*self.per_axis_channels:]
+
+        # ===== axis-aware gates =====
+        g_acc  = self.fc_acc(acc_stat)
+        g_gyro = self.fc_gyro(gyro_stat)
+        g_ori  = self.fc_ori(ori_stat)
+
+        # ===== concat gates =====
+        g = torch.cat([g_acc, g_gyro, g_ori], dim=1)  # [B, C]
+
+        return x * g.unsqueeze(-1)
+
+class AxisAwareTemporalIMUEncoder(nn.Module):
+    def __init__(self, in_dim=18, hidden_dim=96, lstm_layers=1, dropout=0.2):
+        super().__init__()
+
+        self.conv1 = nn.Conv1d(in_dim, hidden_dim, kernel_size=3, padding=1)
+        self.relu = nn.ReLU(inplace=True)
+
+        # ⭐ 新增：
+        self.soft_gate = AxisAwareTemporalGate(hidden_dim, reduction=4)
+
+        self.lstm = nn.LSTM(
+            hidden_dim,
+            hidden_dim,
+            num_layers=lstm_layers,
+            batch_first=True
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x_list):
+        """
+        x_list: list of [T_i, C], length = B
+        """
+        device = x_list[0].device
+        lengths = torch.tensor([x.shape[0] for x in x_list], device=device)
+
+        # ===== padding =====
+        x_padded = pad_sequence(x_list, batch_first=True)  # [B, T, C]
+        x = x_padded.transpose(1, 2)                       # [B, C, T]
+
+        # ===== Conv =====
+        x = self.relu(self.conv1(x))
+
+        # ⭐ Soft grouping（关键创新点）
+        x = self.soft_gate(x)
+
+        # ===== LSTM =====
+        x = x.transpose(1, 2)  # [B, T, hidden_dim]
+        packed = pack_padded_sequence(
+            x, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
+        packed_out, _ = self.lstm(packed)
+        out_unpacked, _ = pad_packed_sequence(
+            packed_out, batch_first=True
+        )
+
+        # ===== masked temporal mean pooling =====
+        mask = (
+            torch.arange(out_unpacked.size(1), device=device)[None, :]
+            < lengths[:, None]
+        ).unsqueeze(-1).float()
+
+        out = (out_unpacked * mask).sum(dim=1) / lengths.unsqueeze(1)
+        out = self.dropout(out)
+        return out
+
+
 # ================== 3. Fusion (modified) ==================
 class GMUFusion(nn.Module):
     def __init__(self, feature_dim=128, dropout=0.2):
-        """
-        GMU Fusion: 专门为 M=2（如 RGB + IMU）设计的模态融合
-        feature_dim: 每个模态 embedding 的维度
-        """
         super().__init__()
         # g = sigmoid(W * [rgb, imu])
         self.gate = nn.Linear(feature_dim * 2, feature_dim)
@@ -179,18 +444,18 @@ class GMUFusion(nn.Module):
         self.norm = nn.LayerNorm(feature_dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, features):
-        """
-        features: list of [B, D], [rgb_feat, imu_feat]
-        """
-        rgb, imu = features  # 各 [B, D]
-        h = torch.cat([rgb, imu], dim=-1)   # [B, 2D]
-        g = torch.sigmoid(self.gate(h))     # [B, D]
-        fused = g * rgb + (1 - g) * imu     # [B, D]
-        # 加强非线性
-        enhanced = self.ffn(torch.cat([fused, h], dim=-1))  # [B, 3D]
+    def forward(self, features, return_gate=False):
+        rgb, imu = features
+        h = torch.cat([rgb, imu], dim=-1)
+        g = torch.sigmoid(self.gate(h))  # [B, D]
+        fused = g * rgb + (1 - g) * imu
+        enhanced = self.ffn(torch.cat([fused, h], dim=-1))
         out = self.dropout(self.norm(enhanced))
-        return out   # [B, D]
+        if return_gate:
+            return out, g
+        else:
+            return out
+
 
 # ================== 4. Projectors (modified to include projection to common dim) ==================
 class ContrastiveProjector(nn.Module):
@@ -206,19 +471,42 @@ class ContrastiveProjector(nn.Module):
 
 # ================== 5.Model ==================
 class MultiModalHAR(nn.Module):
-    def __init__(self, num_classes, common_dim=128, contrastive_dim=64, completion_confidence_scale=0.7):
+    def __init__(self, num_classes, common_dim=128, contrastive_dim=64, IMUtype="Basic"):
         super().__init__()
 
         # only keep rgb + imu encoders
         self.rgb_enc = RGBEncoder()
-        self.imu_enc = IMUEncoder()
+        if IMUtype == "Basic":
+            self.imu_enc = IMUEncoder()
+        elif IMUtype == "GroupSE":
+            self.imu_enc = GroupSEIMUEncoder()
+        elif IMUtype == "SoftChannel":
+            self.imu_enc = SoftChannelIMUEncoder()
+        elif IMUtype == "AxisAwareTemporal":
+            self.imu_enc = AxisAwareTemporalIMUEncoder()
 
         # project to common dim
-        self.to_common = nn.ModuleList([
-            nn.Linear(512, common_dim),   # rgb
-            # nn.Linear(66,  common_dim)    # imu
-            nn.Linear(128, common_dim)  # imu
-        ])
+        if IMUtype == "Basic":
+            self.to_common = nn.ModuleList([
+                nn.Linear(512, common_dim),
+                nn.Linear(128, common_dim)
+            ])
+        elif IMUtype == "GroupSE":
+            self.to_common = nn.ModuleList([
+                nn.Linear(512, common_dim),
+                nn.Linear(96, common_dim)
+            ])
+        elif IMUtype == "SoftChannel":
+            self.to_common = nn.ModuleList([
+                nn.Linear(512, common_dim),
+                nn.Linear(128, common_dim)
+            ])
+        elif IMUtype == "AxisAwareTemporal":
+            self.to_common = nn.ModuleList([
+                nn.Linear(512, common_dim),
+                nn.Linear(96, common_dim)
+            ])
+
         for m in self.to_common:
             nn.init.xavier_uniform_(m.weight)
             nn.init.zeros_(m.bias)
@@ -236,11 +524,11 @@ class MultiModalHAR(nn.Module):
         self.proj_rgb = ContrastiveProjector(common_dim, contrastive_dim)
         self.proj_imu = ContrastiveProjector(common_dim, contrastive_dim)
 
-    def forward(self, rgb, depth, skel, imu, mode="classification", do_completion=False):
+    def forward(self, rgb, imu, mode="classification"):
 
         # only extract rgb+imu
         f_rgb = self.rgb_enc(rgb)      # [B,512]
-        f_imu = self.imu_enc(imu)      # [B,128]
+        f_imu = self.imu_enc(imu)
 
         # project to common dim
         c_rgb = self.to_common[0](f_rgb)
@@ -248,17 +536,17 @@ class MultiModalHAR(nn.Module):
         c_list = [c_rgb, c_imu]
 
         if mode == "classification":
-            fused = self.fusion(c_list)
-            out = self.fc(torch.cat([fused], dim=1))
-            return out, None, None
+            fused, gate = self.fusion(c_list, return_gate=True)
+            # out = self.fc(fused)
+            out = self.fc(f_imu)
+            return out, gate
 
-
-        elif mode in ("contrastive", "contrastive_with_completion"):
+        elif mode == "contrastive":
             p_rgb = self.proj_rgb(c_rgb)
             p_imu = self.proj_imu(c_imu)
-            return (p_rgb, p_imu), (None, None), None
+            return (p_rgb, p_imu)
 
-# ================== 6.Loss  ==================
+# ================== 6.pretrain  ==================
 def cross_modal_contrastive(z1, z2, labels, temperature=0.07):
     logits = torch.matmul(z1, z2.T) / temperature
     mask = torch.eq(labels.unsqueeze(1), labels.unsqueeze(0)).float().to(z1.device)
@@ -347,7 +635,6 @@ def prototype_contrastive_loss(embeddings, labels, queue=None, temperature=0.07,
         loss = - (pos_logits - logsum)
         return loss.mean()
 
-# ================== 7.utils ==================
 class MemoryQueue:
     def __init__(self, feature_dim, queue_size=2048, device='cuda'):
         self.queue_size = queue_size
@@ -381,20 +668,6 @@ class MemoryQueue:
     def get_queue(self):
         return self.queue[:self.registered], self.labels[:self.registered]
 
-def set_encoder_trainable(model, requires_grad: bool):
-    # for enc in [model.rgb_enc, model.depth_enc, model.skel_enc, model.imu_enc]:
-    for enc in [model.rgb_enc, model.imu_enc]:
-        for p in enc.parameters():
-            p.requires_grad = requires_grad
-
-def seed_worker(worker_id):
-    global CURRENT_EPOCH
-    # 每个 worker 的种子 = torch initial seed + 当前 epoch
-    worker_seed = (torch.initial_seed() + CURRENT_EPOCH) % 2 ** 32
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
-
-# ================== 8.pretrain & finetune & validation ==================
 def pretrain_contrastive_amp_supcon_with_queue(
     model, dataloader, optimizer, device,
     lambda_cross=0.5,
@@ -423,8 +696,7 @@ def pretrain_contrastive_amp_supcon_with_queue(
         imu = [x.to(device) for x in batch["imu"]]
         labels = batch['label'].to(device)
         with torch.amp.autocast("cuda"):
-            (p_rgb, p_imu), (c_rgb, c_imu), completion_outputs = \
-                model(rgb, None, None, imu, mode="contrastive_with_completion", do_completion=True)
+            (p_rgb, p_imu) = model(rgb, imu, mode="contrastive")
             supcon_losses = []
             for name, p_feat in zip(["rgb", "imu"], [p_rgb, p_imu]):
                 q_feat, q_label = queues[name].get_queue()
@@ -518,10 +790,7 @@ def pretrain_contrastive_supcon(
         labels = batch['label'].to(device)
 
         with torch.amp.autocast("cuda"):
-            (p_rgb, p_imu), _, _ = model(
-                rgb, None, None, imu, mode="contrastive_with_completion", do_completion=True
-            )
-
+            (p_rgb, p_imu) = model(rgb, imu, mode="contrastive")
             # --------------------- supcon loss ---------------------
             supcon_losses = []
             queues_ready = True
@@ -584,8 +853,9 @@ def pretrain_contrastive_supcon(
 
     return total_loss / len(dataloader)
 
+# ================== 7.finetune & validation ==================
 def finetune_classification(
-    model, dataloader, optimizer, criterion, device,
+    model, dataloader, optimizer, criterion, device, cls_only=False
 ):
     model.train()
     scaler = torch.amp.GradScaler('cuda')
@@ -603,30 +873,31 @@ def finetune_classification(
 
         with torch.amp.autocast("cuda"):
             # classification forward
-            logits, _, _ = model(rgb, None, None, imu, mode="classification", do_completion=False)
+            logits, gate = model(rgb, imu, mode="classification")
 
             mask = labels >= 0
             if mask.sum() == 0: continue
-
             logit_f = logits[mask]
             label_f = labels[mask]
+
             # cls loss 强制 FP32
             cls_loss = criterion(logit_f.float(), label_f)
-            loss = cls_loss
 
-        # ---- AMP backward ----
+            if cls_only:
+                loss = cls_loss
+            else:
+                # Class-aware Gate Regularization
+                gate_mean = gate.mean(dim=1)  # [B]
+                target_gate = torch.full_like(gate_mean, 0.5)
+                gate_loss = F.mse_loss(gate_mean, target_gate)
+                lambda_gate = 0.05
+                loss = cls_loss + lambda_gate * gate_loss
+
         scaler.scale(loss).backward()
 
         # optional: 防止 FP16 梯度爆炸
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
-        # if step == 0:
-        #     imu_grads = [p.grad.abs().mean().item() for p in model.imu_enc.parameters() if p.grad is not None]
-        #     if imu_grads:  # 避免为空
-        #         print("imu encoder grad mean:", sum(imu_grads) / len(imu_grads))
-        #     else:
-        #         print("imu encoder grad mean: None (梯度还没计算)")
 
         scaler.step(optimizer)
         scaler.update()
@@ -651,7 +922,7 @@ def validate_classification(model, dataloader, criterion, device):
             imu = [x.to(device) for x in batch["imu"]]
             labels = batch["label"].to(device)
 
-            logits, _, _ = model(rgb, None, None, imu, mode="classification", do_completion=False)
+            logits, _ = model(rgb, imu, mode="classification")
 
             mask = labels >= 0
             if mask.sum() == 0:
@@ -668,6 +939,19 @@ def validate_classification(model, dataloader, criterion, device):
 
     return total_loss / total_count, total_acc / total_count
 
+# ================== 8.utils ==================
+def set_encoder_trainable(model, requires_grad: bool):
+    # for enc in [model.rgb_enc, model.depth_enc, model.skel_enc, model.imu_enc]:
+    for enc in [model.rgb_enc, model.imu_enc]:
+        for p in enc.parameters():
+            p.requires_grad = requires_grad
+
+def seed_worker(worker_id):
+    global CURRENT_EPOCH
+    # 每个 worker 的种子 = torch initial seed + 当前 epoch
+    worker_seed = (torch.initial_seed() + CURRENT_EPOCH) % 2 ** 32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 # ================== Main ==================
 if __name__ == "__main__":
@@ -678,7 +962,7 @@ if __name__ == "__main__":
     torch.cuda.empty_cache()
     gc.collect()
 
-    feature_root = r"D:\HAR\MMAct_preprocessed_clean\train"
+    feature_root = r"D:\HAR\MMAct_preprocessed_proposed\train"
     dataset = PTFeatureDataset(feature_root, max_frames=16)
     dataloader = DataLoader(
         dataset,
@@ -692,7 +976,7 @@ if __name__ == "__main__":
         worker_init_fn=seed_worker
     )
 
-    val_root = r"D:\HAR\MMAct_preprocessed_clean\val"
+    val_root = r"D:\HAR\MMAct_preprocessed_proposed\val"
     val_dataset = PTFeatureDataset(val_root, max_frames=16)
     val_loader = DataLoader(
         val_dataset,
@@ -703,12 +987,10 @@ if __name__ == "__main__":
         pin_memory=True
     )
 
-
     #模型 & 损失
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MultiModalHAR(num_classes=35, common_dim=128, contrastive_dim=64).to(device)
+    model = MultiModalHAR(num_classes=35, common_dim=128, contrastive_dim=64, IMUtype="SoftChannel").to(device)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-    accumulation_steps = 1
 
     # ================== 1.pretrain ==================
     # if_pretrain = True
@@ -754,7 +1036,7 @@ if __name__ == "__main__":
             print(f"[Pretrain] Epoch {epoch}: loss={loss:.4f}")
             torch.save(model.state_dict(), f"pretrain/pretrain_epoch_{epoch}.pth")
     # else:
-    #     pretrain_path = "pretrain_rgbimu/pretrain_epoch_49.pth"
+    #     pretrain_path = "pretrain/pretrain_epoch_49.pth"
     #     checkpoint = torch.load(pretrain_path, map_location=device)
     #     model_dict = model.state_dict()
     #     filtered_ckpt = {k: v for k, v in checkpoint.items()
@@ -770,13 +1052,13 @@ if __name__ == "__main__":
     val_interval = 3
 
     for p in model.rgb_enc.parameters():
-        p.requires_grad = True
+        p.requires_grad = False
     for p in model.imu_enc.parameters():
         p.requires_grad = True
     for p in model.to_common.parameters():
-        p.requires_grad = True
+        p.requires_grad = False
     for p in model.fusion.parameters():
-        p.requires_grad = True
+        p.requires_grad = False
     for p in model.fc.parameters():
         p.requires_grad = True
 
@@ -793,7 +1075,7 @@ if __name__ == "__main__":
 
     for epoch in range(num_finetune_epochs):
         loss, acc = finetune_classification(
-            model, dataloader, optimizer, criterion, device,
+            model, dataloader, optimizer, criterion, device, cls_only=True
         )
         print(f"[Finetune] Epoch {epoch}: loss={loss:.4f}, acc={acc:.4f}")
         scheduler.step()
@@ -810,6 +1092,3 @@ if __name__ == "__main__":
                 print(f"✨ 保存最佳模型: Epoch {epoch}, val_acc={val_acc:.4f}")
 
     print(f"✅ 训练结束！最佳验证准确率: {best_val_acc:.4f}")
-
-
-
